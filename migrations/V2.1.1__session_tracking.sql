@@ -1,12 +1,5 @@
 use schema dev_demo_schema;
 
-create or replace task TASK_NP_SESSION_TRACKING_INFO_TEST
-	warehouse=alert_demo_wh
-	schedule='USING CRON 0 1 * * * UTC'
-	as call SP_NP_SESSION_TRACKING_INSERT_TEST();
-	
-
-
 
 CREATE OR REPLACE PROCEDURE "SP_NP_SESSION_TRACKING_INSERT_TEST"()
 RETURNS VARCHAR(100)
