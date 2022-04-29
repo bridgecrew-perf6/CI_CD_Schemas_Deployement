@@ -637,3 +637,15 @@ var stmt = snowflake.createStatement({sqlText: sql_command});
 stmt.execute();
 return "Successful";
 ';
+
+CREATE or replace task TASK_NP_ALERT_TRIGGER
+	warehouse=DEV_DEMO_WH
+	schedule='USING CRON 33 22 * * * UTC'
+	as call SP_ALERT_TRIGGER();
+
+
+
+CREATE or replace task TASK_NP_ALERT_STORE
+	warehouse=DEV_DEMO_WH
+	after STUBHUB.ENRICHED.TASK_NP_ALERT_TRIGGER
+	as call SP_ALERT_APP_INSERT();
