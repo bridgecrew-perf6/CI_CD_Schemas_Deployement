@@ -153,6 +153,168 @@ create or replace TABLE WINDOWSNXLOG_ML_SCORE_BATCH (
 
 
 
+CREATE OR REPLACE FUNCTION "FN_ML_ANALYST_FB"("P_SOURCE_NM" VARCHAR(16777216), "P_ANALYST_NM" VARCHAR(16777216), "P_TYPE" VARCHAR(16777216))
+RETURNS TABLE ("ANALYST_NAME" VARCHAR(16777216), "EVENT_DATE" DATE, "TYPE" VARCHAR(16777216), "USER_NAME" VARCHAR(16777216), "FEATURE_VAL" VARIANT, "ALERT_AGG" VARIANT, "TS_AGG" VARIANT, "ADJ_ZSCORE" VARIANT, "ADJ_ANOMALY_SCORE" FLOAT)
+LANGUAGE SQL
+AS '
+with uore_type as
+(
+select value :: varchar as type from lateral flatten(input=>split((case when P_TYPE = ''both'' THEN ''user,entity'' else P_TYPE end), '',''))
+),
+ml_user_score as
+(
+  select analyst_name, event_date, type, user_name, anomaly_score, feature_val, alert_agg, ts_agg, feature_name, feature_zscore from
+  (
+    select 
+    lower(P_ANALYST_NM) as analyst_name,
+    event_date,
+    type as type,
+    name as user_name,
+    pas as anomaly_score,
+    feature_agg as feature_val,
+    alert_agg as alert_agg,
+	ts_agg as ts_agg,
+    zsc.key as feature_name,
+    zsc.value as feature_zscore,
+    rank() over (partition by event_date, type, name order by execution_timestamp desc) as rnk 
+    from
+    windowsnxlog_ml_score_batch, table(flatten(zscore)) zsc
+    where lower(P_SOURCE_NM) = ''windowsnxlog'' and type in (select type from uore_type) and zsc.value <> ''NaN''
+  ) where rnk = 1
+  UNION ALL
+  select analyst_name, event_date, type, user_name, anomaly_score, feature_val, alert_agg, ts_agg, feature_name, feature_zscore from
+  (
+    select 
+    lower(P_ANALYST_NM) as analyst_name,
+    event_date,
+    type as type,
+    name as user_name,
+    pas as anomaly_score,
+    feature_agg as feature_val,
+    alert_agg as alert_agg,
+	ts_agg as ts_agg,
+    zsc.key as feature_name,
+    zsc.value as feature_zscore,
+    rank() over (partition by event_date, type, name order by execution_timestamp desc) as rnk 
+    from
+    wgtraffic_ml_score_batch, table(flatten(zscore)) zsc
+    where lower(P_SOURCE_NM) = ''wgtraffic'' AND type in (select type from uore_type) and zsc.value <> ''NaN''
+  ) where rnk = 1
+  UNION ALL
+  select analyst_name, event_date, type, user_name, anomaly_score, feature_val, alert_agg, ts_agg, feature_name, feature_zscore from
+  (
+    select 
+    lower(P_ANALYST_NM) as analyst_name,
+    event_date,
+    type as type,
+    name as user_name,
+    pas as anomaly_score,
+    feature_agg as feature_val,
+    alert_agg as alert_agg,
+	ts_agg as ts_agg,
+    zsc.key as feature_name,
+    zsc.value as feature_zscore,
+    rank() over (partition by event_date, type, name order by execution_timestamp desc) as rnk 
+    from
+    msexchange_ml_score_batch, table(flatten(zscore)) zsc
+    where lower(P_SOURCE_NM) = ''msexchange'' AND type in (select type from uore_type) and zsc.value <> ''NaN''
+  ) where rnk = 1
+),
+pas_fb as 
+(
+  select analyst_name, type, user_name, duration_from, duration_to, pas_adj_by
+  from
+  (
+    select 
+    analyst_name,
+    ue_type as type,
+    ue_name as user_name,
+    score_adj_range,
+    score_adj_param,
+    case when time_frame = ''indefinite'' then ''1900-01-01'' else duration_from end as duration_from,
+    case when time_frame = ''indefinite'' then ''2100-12-31'' else duration_to end as duration_to,
+    case when score_adj_type = ''decrease'' then -1 * score_adj_value/100
+       when score_adj_type = ''increase'' then score_adj_value/100
+       when score_adj_type = ''ignore'' then -1
+    end as pas_adj_by,
+    rank() over (partition by analyst_name, type, ue_name order by processing_dttm desc) as rnk
+    from ANALYST_FEEDBACK
+    where analyst_name = lower(P_ANALYST_NM) and ue_category = ''individual'' and type in (select type from uore_type) and score_adj_range = ''overall''
+  ) where rnk = 1
+),
+zsc_fb as 
+(
+  select analyst_name, type, user_name, duration_from, duration_to, score_adj_param as feature_name, zsc_adj_by
+  from
+  (
+    select 
+    analyst_name,
+    ue_name as user_name,
+    ue_type as type,
+    score_adj_range,
+    score_adj_param,
+    case when time_frame = ''indefinite'' then ''1900-01-01'' else duration_from end as duration_from,
+    case when time_frame = ''indefinite'' then ''2100-12-31'' else duration_to end as duration_to,
+    case when score_adj_type = ''decrease'' then -1 * score_adj_value/100
+         when score_adj_type = ''increase'' then score_adj_value/100
+         when score_adj_type = ''ignore'' then -1
+    end as zsc_adj_by,
+    rank() over (partition by analyst_name, type, ue_name, score_adj_param order by processing_dttm desc) as rnk
+    from ANALYST_FEEDBACK
+    where analyst_name = lower(P_ANALYST_NM) and ue_category = ''individual'' and type in (select type from uore_type) and score_adj_range = ''feature''
+  ) where rnk = 1
+)
+select 
+mlz.analyst_name, 
+mlz.event_date, 
+mlz.type,
+mlz.user_name,
+mlz.feature_val,
+mlz.alert_agg,
+mlz.ts_agg,
+mlz.adj_zscore,
+mlz.anomaly_score + (mlz.anomaly_score * coalesce(pas.pas_adj_by,0)) as adj_anomaly_score
+from(
+  select 
+  analyst_name,
+  event_date,
+  type,
+  user_name,
+  anomaly_score,
+  feature_val,
+  alert_agg,
+  ts_agg,
+  parse_json (''{''|| listagg(feature_name || '':'' || adj_feature_zscore,'', '') || ''}'') as adj_zscore
+  from
+  (
+    select 
+    ml.analyst_name,
+    ml.event_date,
+    ml.user_name,
+    ml.type,
+    ml.feature_name,
+    ml.anomaly_score,
+    ml.feature_val,
+    ml.alert_agg,
+    ml.ts_agg,
+    ml.feature_zscore + (ml.feature_zscore * coalesce(zsc.zsc_adj_by,0)) as adj_feature_zscore
+    from ml_user_score ml 
+    left join zsc_fb zsc
+      on  ml.analyst_name = zsc.analyst_name
+      and ml.type = zsc.type
+      and ml.user_name = zsc.user_name
+      and ml.feature_name = zsc.feature_name
+      and ml.event_date between zsc.duration_from and zsc.duration_to
+  )group by 1,2,3,4,5,6,7,8
+)mlz
+left join pas_fb pas
+  on  mlz.analyst_name = pas.analyst_name
+  and mlz.type = pas.type
+  and mlz.user_name  = pas.user_name
+  and mlz.event_date between pas.duration_from and pas.duration_to
+';
+
+
 create or replace view NP_ITD_ML_SOURCES(
 	ZSCORE,
 	USER_NAME,
@@ -411,166 +573,6 @@ where EVENT_DATE >= DATEADD(DAY, -30, CURRENT_TIMESTAMP) group by 1,2,3,4,5,6,7,
 
 
 
-CREATE OR REPLACE FUNCTION "FN_ML_ANALYST_FB"("P_SOURCE_NM" VARCHAR(16777216), "P_ANALYST_NM" VARCHAR(16777216), "P_TYPE" VARCHAR(16777216))
-RETURNS TABLE ("ANALYST_NAME" VARCHAR(16777216), "EVENT_DATE" DATE, "TYPE" VARCHAR(16777216), "USER_NAME" VARCHAR(16777216), "FEATURE_VAL" VARIANT, "ALERT_AGG" VARIANT, "TS_AGG" VARIANT, "ADJ_ZSCORE" VARIANT, "ADJ_ANOMALY_SCORE" FLOAT)
-LANGUAGE SQL
-AS '
-with uore_type as
-(
-select value :: varchar as type from lateral flatten(input=>split((case when P_TYPE = ''both'' THEN ''user,entity'' else P_TYPE end), '',''))
-),
-ml_user_score as
-(
-  select analyst_name, event_date, type, user_name, anomaly_score, feature_val, alert_agg, ts_agg, feature_name, feature_zscore from
-  (
-    select 
-    lower(P_ANALYST_NM) as analyst_name,
-    event_date,
-    type as type,
-    name as user_name,
-    pas as anomaly_score,
-    feature_agg as feature_val,
-    alert_agg as alert_agg,
-	ts_agg as ts_agg,
-    zsc.key as feature_name,
-    zsc.value as feature_zscore,
-    rank() over (partition by event_date, type, name order by execution_timestamp desc) as rnk 
-    from
-    windowsnxlog_ml_score_batch, table(flatten(zscore)) zsc
-    where lower(P_SOURCE_NM) = ''windowsnxlog'' and type in (select type from uore_type) and zsc.value <> ''NaN''
-  ) where rnk = 1
-  UNION ALL
-  select analyst_name, event_date, type, user_name, anomaly_score, feature_val, alert_agg, ts_agg, feature_name, feature_zscore from
-  (
-    select 
-    lower(P_ANALYST_NM) as analyst_name,
-    event_date,
-    type as type,
-    name as user_name,
-    pas as anomaly_score,
-    feature_agg as feature_val,
-    alert_agg as alert_agg,
-	ts_agg as ts_agg,
-    zsc.key as feature_name,
-    zsc.value as feature_zscore,
-    rank() over (partition by event_date, type, name order by execution_timestamp desc) as rnk 
-    from
-    wgtraffic_ml_score_batch, table(flatten(zscore)) zsc
-    where lower(P_SOURCE_NM) = ''wgtraffic'' AND type in (select type from uore_type) and zsc.value <> ''NaN''
-  ) where rnk = 1
-  UNION ALL
-  select analyst_name, event_date, type, user_name, anomaly_score, feature_val, alert_agg, ts_agg, feature_name, feature_zscore from
-  (
-    select 
-    lower(P_ANALYST_NM) as analyst_name,
-    event_date,
-    type as type,
-    name as user_name,
-    pas as anomaly_score,
-    feature_agg as feature_val,
-    alert_agg as alert_agg,
-	ts_agg as ts_agg,
-    zsc.key as feature_name,
-    zsc.value as feature_zscore,
-    rank() over (partition by event_date, type, name order by execution_timestamp desc) as rnk 
-    from
-    msexchange_ml_score_batch, table(flatten(zscore)) zsc
-    where lower(P_SOURCE_NM) = ''msexchange'' AND type in (select type from uore_type) and zsc.value <> ''NaN''
-  ) where rnk = 1
-),
-pas_fb as 
-(
-  select analyst_name, type, user_name, duration_from, duration_to, pas_adj_by
-  from
-  (
-    select 
-    analyst_name,
-    ue_type as type,
-    ue_name as user_name,
-    score_adj_range,
-    score_adj_param,
-    case when time_frame = ''indefinite'' then ''1900-01-01'' else duration_from end as duration_from,
-    case when time_frame = ''indefinite'' then ''2100-12-31'' else duration_to end as duration_to,
-    case when score_adj_type = ''decrease'' then -1 * score_adj_value/100
-       when score_adj_type = ''increase'' then score_adj_value/100
-       when score_adj_type = ''ignore'' then -1
-    end as pas_adj_by,
-    rank() over (partition by analyst_name, type, ue_name order by processing_dttm desc) as rnk
-    from ANALYST_FEEDBACK
-    where analyst_name = lower(P_ANALYST_NM) and ue_category = ''individual'' and type in (select type from uore_type) and score_adj_range = ''overall''
-  ) where rnk = 1
-),
-zsc_fb as 
-(
-  select analyst_name, type, user_name, duration_from, duration_to, score_adj_param as feature_name, zsc_adj_by
-  from
-  (
-    select 
-    analyst_name,
-    ue_name as user_name,
-    ue_type as type,
-    score_adj_range,
-    score_adj_param,
-    case when time_frame = ''indefinite'' then ''1900-01-01'' else duration_from end as duration_from,
-    case when time_frame = ''indefinite'' then ''2100-12-31'' else duration_to end as duration_to,
-    case when score_adj_type = ''decrease'' then -1 * score_adj_value/100
-         when score_adj_type = ''increase'' then score_adj_value/100
-         when score_adj_type = ''ignore'' then -1
-    end as zsc_adj_by,
-    rank() over (partition by analyst_name, type, ue_name, score_adj_param order by processing_dttm desc) as rnk
-    from ANALYST_FEEDBACK
-    where analyst_name = lower(P_ANALYST_NM) and ue_category = ''individual'' and type in (select type from uore_type) and score_adj_range = ''feature''
-  ) where rnk = 1
-)
-select 
-mlz.analyst_name, 
-mlz.event_date, 
-mlz.type,
-mlz.user_name,
-mlz.feature_val,
-mlz.alert_agg,
-mlz.ts_agg,
-mlz.adj_zscore,
-mlz.anomaly_score + (mlz.anomaly_score * coalesce(pas.pas_adj_by,0)) as adj_anomaly_score
-from(
-  select 
-  analyst_name,
-  event_date,
-  type,
-  user_name,
-  anomaly_score,
-  feature_val,
-  alert_agg,
-  ts_agg,
-  parse_json (''{''|| listagg(feature_name || '':'' || adj_feature_zscore,'', '') || ''}'') as adj_zscore
-  from
-  (
-    select 
-    ml.analyst_name,
-    ml.event_date,
-    ml.user_name,
-    ml.type,
-    ml.feature_name,
-    ml.anomaly_score,
-    ml.feature_val,
-    ml.alert_agg,
-    ml.ts_agg,
-    ml.feature_zscore + (ml.feature_zscore * coalesce(zsc.zsc_adj_by,0)) as adj_feature_zscore
-    from ml_user_score ml 
-    left join zsc_fb zsc
-      on  ml.analyst_name = zsc.analyst_name
-      and ml.type = zsc.type
-      and ml.user_name = zsc.user_name
-      and ml.feature_name = zsc.feature_name
-      and ml.event_date between zsc.duration_from and zsc.duration_to
-  )group by 1,2,3,4,5,6,7,8
-)mlz
-left join pas_fb pas
-  on  mlz.analyst_name = pas.analyst_name
-  and mlz.type = pas.type
-  and mlz.user_name  = pas.user_name
-  and mlz.event_date between pas.duration_from and pas.duration_to
-';
 
 
 CREATE OR REPLACE FUNCTION "FN_ML_OVERALL_AGG"("P_ANALYST_NM" VARCHAR(16777216))
