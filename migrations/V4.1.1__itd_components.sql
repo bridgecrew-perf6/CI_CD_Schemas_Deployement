@@ -1,5 +1,4 @@
 use schema dev_demo_schema;
-
 create or replace TABLE MSEXCHANGE_ML_SCORE_BATCH (
 	EVENT_DATE DATE,
 	NAME VARCHAR(2000),
